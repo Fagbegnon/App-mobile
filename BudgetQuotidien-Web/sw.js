@@ -1,5 +1,5 @@
 /* Service worker — cache pour fonctionnement hors-ligne */
-const CACHE = 'budget-quotidien-v2';
+const CACHE = 'budget-quotidien-v3';
 const ASSETS = [
   './',
   './index.html',

@@ -71,7 +71,9 @@ function snapshot(budget, today = new Date()) {
   const totalIncome = budget.incomes.reduce((s, i) => s + i.amount, 0);
   const totalBudget = budget.initialAmount + totalIncome;
   const totalSpent = budget.expenses.reduce((s, e) => s + e.amount, 0);
-  const remaining = totalBudget - totalSpent;
+  // Dettes réservées : le solde du mois les rembourse, le budget est fait avec le reste.
+  const totalDebt = (budget.debts || []).reduce((s, d) => s + d.amount, 0);
+  const remaining = totalBudget - totalSpent - totalDebt;
 
   const start = parseDate(budget.startDate);
   const end = parseDate(budget.endDate);
@@ -80,20 +82,20 @@ function snapshot(budget, today = new Date()) {
   const daysRemaining = daysBetweenInclusive(refToday, end);
   const daysElapsed = Math.max(daysBetweenInclusive(start, today) - 1, 0);
 
-  const initialDaily = totalBudget / totalDays;
-  const recommended = Math.max(remaining, 0) / daysRemaining;   // recalcul quotidien
+  const initialDaily = Math.max(totalBudget - totalDebt, 0) / totalDays;
+  const recommended = Math.max(remaining, 0) / daysRemaining;   // recalcul quotidien, après dettes
   const spentToday = budget.expenses.filter(e => sameDay(e.date, today)).reduce((s, e) => s + e.amount, 0);
   const remainingToday = recommended - spentToday;
 
   const dayConsumption = recommended > 0 ? spentToday / recommended : (spentToday > 0 ? 1 : 0);
-  const monthConsumption = totalBudget > 0 ? Math.min(Math.max(totalSpent / totalBudget, 0), 1) : 0;
+  const monthConsumption = totalBudget > 0 ? Math.min(Math.max((totalSpent + totalDebt) / totalBudget, 0), 1) : 0;
 
   let status = 'healthy';
   if (spentToday > recommended) status = 'over';
   else if (remainingToday <= recommended * 0.2) status = 'warning';
 
   return {
-    totalIncome, totalBudget, totalSpent, remaining, initialAmount: budget.initialAmount,
+    totalIncome, totalBudget, totalSpent, totalDebt, remaining, initialAmount: budget.initialAmount,
     totalDays, daysElapsed, daysRemaining, initialDaily, recommended,
     spentToday, remainingToday, dayConsumption, monthConsumption, status,
   };
@@ -115,7 +117,8 @@ function respectedDays(budget, today = new Date()) {
 
 function remainingCurve(budget, today = new Date()) {
   const start = parseDate(budget.startDate);
-  const total = budget.initialAmount + budget.incomes.reduce((s, i) => s + i.amount, 0);
+  const debt = (budget.debts || []).reduce((s, d) => s + d.amount, 0);
+  const total = budget.initialAmount + budget.incomes.reduce((s, i) => s + i.amount, 0) - debt;
   const days = daysBetweenInclusive(start, parseDate(budget.endDate));
   const byDay = {};
   budget.expenses.forEach(e => { const k = isoDate(e.date); byDay[k] = (byDay[k] || 0) + e.amount; });
@@ -145,7 +148,11 @@ let state = load();
 function load() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s.budget && !Array.isArray(s.budget.debts)) s.budget.debts = []; // migration
+      return s;
+    }
   } catch (e) {}
   return { onboarded: false, budget: null };
 }
@@ -237,7 +244,7 @@ function renderSetup(isFirst = true) {
     if (amount <= 0) { amountEl.focus(); return; }
     state.budget = {
       initialAmount: amount, startDate: startEl.value, endDate: endEl.value,
-      currency: currEl.value, incomes: [], expenses: [],
+      currency: currEl.value, incomes: [], expenses: [], debts: [],
     };
     save(); haptic(15); currentTab = 'home'; render();
   };
@@ -287,6 +294,7 @@ function renderHome() {
         <strong style="color:${s.remaining < 0 ? 'var(--danger)' : 'var(--positive)'}">${money(s.remaining, code)}</strong></div>
       <div class="bar" style="margin:14px 0 10px;"><span style="width:${s.monthConsumption * 100}%;background:${s.remaining < 0 ? 'var(--danger)' : 'var(--positive)'}"></span></div>
       <div class="row between small muted"><span>${money(s.totalSpent, code)} dépensés</span><span>sur ${money(s.totalBudget, code)}</span></div>
+      ${s.totalDebt > 0 ? `<div class="row between small" style="margin-top:6px;"><span class="muted">Réservé aux dettes</span><span style="color:var(--warning);font-weight:600;">− ${money(s.totalDebt, code)}</span></div>` : ''}
     </div>
 
     <div class="grid2">
@@ -384,9 +392,11 @@ function renderBudget() {
       ${statRow('Budget initial', money(s.initialAmount, code))}
       ${statRow('Argent ajouté', '+ ' + money(s.totalIncome, code), 'var(--positive)')}
       ${statRow('Budget total', money(s.totalBudget, code))}
-      ${statRow('Total dépensé', money(s.totalSpent, code), 'var(--danger)')}
+      ${s.totalDebt > 0 ? statRow('Dettes à rembourser', '− ' + money(s.totalDebt, code), 'var(--warning)') : ''}
+      ${statRow('Total dépensé', '− ' + money(s.totalSpent, code), 'var(--danger)')}
       ${statRow('Budget restant', money(s.remaining, code), s.remaining < 0 ? 'var(--danger)' : 'var(--positive)')}
     </div>
+    ${debtsCard(b, code)}
     <div class="card">
       <h2 style="margin-bottom:12px;">Évolution du budget</h2>
       ${lineChart(remainingCurve(b), s.totalBudget)}
@@ -397,11 +407,45 @@ function renderBudget() {
     </div>
   `;
   document.getElementById('addMoneyBtn').onclick = openAddIncome;
+  const addDebtBtn = document.getElementById('addDebtBtn');
+  if (addDebtBtn) addDebtBtn.onclick = openAddDebt;
+  document.querySelectorAll('[data-deldebt]').forEach(btn => btn.onclick = () => {
+    b.debts = b.debts.filter(x => x.id !== btn.dataset.deldebt); save(); haptic(); renderBudget();
+  });
 }
 
 function statRow(label, val, color = 'var(--text)') {
   return `<div class="row between" style="padding:9px 0;border-top:1px solid var(--separator);">
     <span class="muted small">${label}</span><strong style="color:${color}">${val}</strong></div>`;
+}
+
+/* ---- Carte des dettes ---- */
+function debtsCard(b, code) {
+  const debts = b.debts || [];
+  const total = debts.reduce((s, d) => s + d.amount, 0);
+  return `<div class="card">
+    <div class="row between" style="margin-bottom:${debts.length ? '6px' : '0'};">
+      <h2>Dettes</h2>
+      <button class="pill" id="addDebtBtn" style="color:var(--positive);">＋ Ajouter</button>
+    </div>
+    ${debts.length
+      ? debts.map(d => debtRow(d, code)).join('') +
+        `<div class="row between" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--separator);">
+           <strong>Total dettes</strong><strong style="color:var(--warning);">${money(total, code)}</strong></div>`
+      : `<p class="small muted" style="margin:8px 0 0;">Aucune dette. Enregistre une dette : elle sera réservée sur ton budget, et ton montant journalier sera calculé sur le reste.</p>`}
+  </div>`;
+}
+function debtRow(d, code) {
+  const due = d.dueDate ? `Échéance : ${frDate(parseDate(d.dueDate), { day: 'numeric', month: 'short' })}` : 'Sans échéance';
+  return `<div class="list-item">
+    <div class="disc-sm" style="background:var(--warning-soft);color:var(--warning);">🧾</div>
+    <div style="flex:1;min-width:0;">
+      <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHTML(d.label || 'Dette')}</div>
+      <div class="tiny muted">${due}</div>
+    </div>
+    <div style="font-weight:700;color:var(--warning);">${money(d.amount, code)}</div>
+    <button data-deldebt="${d.id}" style="background:none;border:none;color:var(--danger);font-size:18px;padding:4px 0 4px 8px;">✕</button>
+  </div>`;
 }
 
 function statsBlock(b, code) {
@@ -462,6 +506,7 @@ function renderProfile() {
       ${settingRow('📊', 'Statistiques', 'var(--info)', 'stats')}
       ${settingRow('🏆', 'Résumé mensuel', 'var(--warning)', 'summary')}
       ${settingRow('💰', 'Ajouter de l\'argent', 'var(--positive)', 'addmoney')}
+      ${settingRow('🧾', 'Mes dettes', 'var(--warning)', 'debts')}
       ${settingRow('🔁', 'Nouveau budget', 'var(--info)', 'newbudget')}
     </div>
     <div class="card" style="padding:6px 16px;">
@@ -476,6 +521,7 @@ function renderProfile() {
     if (a === 'stats') openStats();
     else if (a === 'summary') openSummary();
     else if (a === 'addmoney') openAddIncome();
+    else if (a === 'debts') { currentTab = 'budget'; render(); }
     else if (a === 'newbudget') openSetupFull();
     else if (a === 'notif') openNotifications();
     else if (a === 'reset') confirmReset();
@@ -612,6 +658,45 @@ function openAddIncome() {
       if (amount <= 0) { document.getElementById('ai-amount').focus(); return; }
       state.budget.incomes.push({ id: uid(), amount, type, details: document.getElementById('ai-details').value.trim(), date: new Date().toISOString() });
       save(); haptic(15); closeSheet(); render();
+    };
+  });
+}
+
+/* ---- Ajouter une dette ---- */
+function openAddDebt() {
+  if (!state.budget) return;
+  const code = state.budget.currency;
+  openSheet(`
+    <div class="sheet-head"><span></span><span class="t">Nouvelle dette</span><span></span></div>
+    <div class="sheet-body">
+      <div class="amount-display">
+        <input id="dt-amount" class="input" type="tel" inputmode="numeric" placeholder="25000"
+          style="font-size:34px;text-align:center;font-weight:800;color:var(--warning);box-shadow:none;background:none;"/>
+        <div class="muted">${symbolFor(code)}</div>
+      </div>
+      <div class="field"><label>Créancier / motif</label>
+        <input class="input" id="dt-label" placeholder="Ex. Prêt Awa, crédit boutique"/></div>
+      <div class="field"><label>Échéance (facultatif)</label>
+        <input class="input" id="dt-due" type="date"/></div>
+      <div class="card" style="background:var(--warning-soft);box-shadow:none;">
+        <p class="small" style="margin:0;">Cette dette sera <strong>réservée sur ton budget</strong> :
+        le solde du mois la rembourse et ton montant journalier est calculé sur le reste.</p></div>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn secondary" id="dt-cancel">Annuler</button>
+      <button class="btn" id="dt-save" style="background:linear-gradient(180deg,var(--warning),#dd8f10);">Enregistrer</button>
+    </div>`, () => {
+    document.getElementById('dt-cancel').onclick = closeSheet;
+    document.getElementById('dt-save').onclick = () => {
+      const amount = parseFloat(document.getElementById('dt-amount').value) || 0;
+      if (amount <= 0) { document.getElementById('dt-amount').focus(); return; }
+      state.budget.debts.push({
+        id: uid(), amount,
+        label: document.getElementById('dt-label').value.trim(),
+        dueDate: document.getElementById('dt-due').value || null,
+        date: new Date().toISOString(),
+      });
+      save(); haptic(15); closeSheet(); currentTab = 'budget'; render();
     };
   });
 }
